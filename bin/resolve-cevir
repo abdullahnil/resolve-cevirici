@@ -1,0 +1,111 @@
+#!/bin/bash
+# resolve-cevir: videoları ücretsiz DaVinci Resolve'un (Linux) açabileceği biçime çevirir.
+#
+#   Normal   : AV1 video + PCM ses (.mp4)    — küçük dosya, Resolve'da sorunsuz açılır
+#   Kayıpsız : DNxHR HQ video + PCM ses (.mov) — görsel kayıp yok, dosya çok büyük
+#
+# Kullanım:
+#   resolve-cevir [SEÇENEKLER] VIDEO...
+#
+# Seçenekler:
+#   -k, --kayipsiz   DNxHR HQ (kayıpsız) çıktı üret
+#   -g, --gpu        Bu seferlik ekran kartını kullan (NVIDIA)
+#   -c, --cpu        Bu seferlik yalnızca işlemciyi kullan
+#   -h, --help       Bu yardımı göster
+#
+# Çıktılar, videonun bulunduğu klasördeki "Resolve" alt klasörüne yazılır.
+# Varsayılan donanım kurulumda seçilir: ~/.config/resolve-cevirici/ayar
+
+set -u
+
+AYAR="${XDG_CONFIG_HOME:-$HOME/.config}/resolve-cevirici/ayar"
+DONANIM=cpu        # gpu | cpu
+AV1_KODLAYICI=libsvtav1
+[ -f "$AYAR" ] && . "$AYAR"
+export SVT_LOG=1   # SVT-AV1'in uzun bilgi çıktısını gizle
+
+KAYIPSIZ=false
+[ "$(basename "$0")" = "resolve-cevir-kayipsiz" ] && KAYIPSIZ=true
+
+if [ -t 1 ]; then Y=$'\e[1;32m'; S=$'\e[1;33m'; K=$'\e[1;31m'; M=$'\e[1;34m'; N=$'\e[0m'; else Y=; S=; K=; M=; N=; fi
+
+dosyalar=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -k|--kayipsiz) KAYIPSIZ=true ;;
+        -g|--gpu)      DONANIM=gpu ;;
+        -c|--cpu)      DONANIM=cpu ;;
+        -h|--help)     sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --)            shift; dosyalar+=("$@"); break ;;
+        -*)            echo "Bilinmeyen seçenek: $1 (yardım için -h)" >&2; exit 1 ;;
+        *)             dosyalar+=("$1") ;;
+    esac
+    shift
+done
+[ ${#dosyalar[@]} -eq 0 ] && { echo "Kullanım: resolve-cevir [-k] [-g|-c] VIDEO...  (yardım: -h)"; exit 1; }
+
+# GPU seçilmiş ama NVENC AV1 yoksa (ör. RTX 30 ve öncesi) işlemciyle kodla
+[ "$DONANIM" = cpu ] && AV1_KODLAYICI=libsvtav1
+
+basarili=0; basarisiz=0
+for f in "${dosyalar[@]}"; do
+    if [ ! -f "$f" ]; then echo "${K}Bulunamadı:${N} $f"; basarisiz=$((basarisiz + 1)); continue; fi
+    cikti_klasoru="$(dirname "$f")/Resolve"
+    mkdir -p "$cikti_klasoru"
+    ad="$(basename "${f%.*}")"
+    cpu_kodla=()
+
+    if $KAYIPSIZ; then
+        out="$cikti_klasoru/$ad-kayipsiz.mov"
+        # DNxHR HQ ≈ piksel başına 0,48 bayt (1080p60 ≈ 60 MB/sn)
+        mb=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate:format=duration \
+               -of default=nw=1 "$f" 2>/dev/null | awk -F= '
+               /^width/ {w=$2} /^height/ {h=$2} /^duration/ {d=$2}
+               /^avg_frame_rate/ {split($2, r, "/"); if (r[2] > 0) fps = r[1] / r[2]}
+               END {printf "%d", w * h * fps * d * 0.48 / 1e6}')
+        mb=${mb:-0}
+        [ "$mb" -ge 1000 ] && tahmin="~$((mb / 1000)) GB" || tahmin="~$mb MB"
+        echo "${M}==>${N} $f  ${S}(tahmini boyut: $tahmin)${N}"
+        kodla=(-map 0:v:0 -map '0:a?' -c:v dnxhd -profile:v dnxhr_hq -pix_fmt yuv422p -c:a pcm_s16le "$out")
+        gpu_giris=(-hwaccel cuda)
+    else
+        out="$cikti_klasoru/$ad.mp4"
+        echo "${M}==>${N} $f"
+        if [ "$AV1_KODLAYICI" = av1_nvenc ]; then
+            kodla=(-map 0:v:0 -map '0:a?' -c:v av1_nvenc -preset p5 -cq 28 -c:a pcm_s16le "$out")
+            # Görüntü ekran kartı belleğinden hiç çıkmadan kodlanır (en hızlısı)
+            gpu_giris=(-hwaccel cuda -hwaccel_output_format cuda)
+            cpu_kodla=(-map 0:v:0 -map '0:a?' -c:v av1_nvenc -preset p5 -cq 28 -pix_fmt yuv420p -c:a pcm_s16le "$out")
+        else
+            kodla=(-map 0:v:0 -map '0:a?' -c:v libsvtav1 -preset 8 -crf 30 -pix_fmt yuv420p -c:a pcm_s16le "$out")
+            gpu_giris=(-hwaccel cuda)
+        fi
+    fi
+    [ ${#cpu_kodla[@]} -eq 0 ] && cpu_kodla=("${kodla[@]}")
+
+    ok=false
+    if [ "$DONANIM" = gpu ]; then
+        # Kart desteklemezse çıkan teknik hatalar gizlenir; işlemci denemesi hataları gösterir
+        if ffmpeg -hide_banner -loglevel fatal -stats -y "${gpu_giris[@]}" -i "$f" "${kodla[@]}"; then
+            ok=true; nerede="ekran kartı"
+        else
+            echo "    ${S}Ekran kartı bu dosyayı çözemedi, işlemciyle deneniyor...${N}"
+        fi
+    fi
+    if ! $ok && ffmpeg -hide_banner -loglevel error -stats -y -i "$f" "${cpu_kodla[@]}"; then
+        ok=true; nerede="işlemci"
+    fi
+
+    if $ok; then
+        echo "    ${Y}Tamam ($nerede):${N} $out ($(du -h "$out" | cut -f1))"
+        basarili=$((basarili + 1))
+    else
+        echo "    ${K}Çevrilemedi:${N} $f"
+        rm -f "$out"
+        basarisiz=$((basarisiz + 1))
+    fi
+done
+
+echo
+echo "Bitti: $basarili başarılı, $basarisiz başarısız."
+[ "$basarisiz" -eq 0 ]
