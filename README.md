@@ -19,7 +19,7 @@ Bu araç videoları Resolve'un sorunsuz açtığı biçimlere çevirir:
 ## Kurulum
 
 ```bash
-git clone https://github.com/KULLANICI_ADIN/resolve-cevirici.git
+git clone https://github.com/abdullahnil/resolve-cevirici.git
 cd resolve-cevirici
 ./kur.sh
 ```
